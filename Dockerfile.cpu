@@ -1,0 +1,29 @@
+# CPU-only fine-tuner image, for DIMER instances without a GPU.
+#
+# Mitra runs on CPU as well as GPU. Fits are considerably slower on CPU, so raise
+# time_limit_seconds for real datasets. train.py already honors DIMER_TRAIN_DEVICE=cpu.
+#
+# DIMER builds the repository's root `Dockerfile`. To deploy the CPU image on a no-GPU
+# instance, make this file the root Dockerfile (rename Dockerfile -> Dockerfile.gpu and
+# Dockerfile.cpu -> Dockerfile) before connecting the repo, or keep a CPU-only fork.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the CPU build of torch first, from PyTorch's CPU index, so the AutoGluon install
+# below does not pull the much larger default CUDA wheel. If pip later resolves a CUDA torch,
+# pin a torch version here that satisfies autogluon.tabular==1.5.0.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Bake our own task type so the Custom/Other -> object_detection normalization can't win.
+ENV DIMER_TASK_TYPE=tabular_classification
+
+COPY train.py ./
+
+CMD ["python", "train.py"]

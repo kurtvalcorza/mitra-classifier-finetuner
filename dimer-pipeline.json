@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "taskType": "tabular_classification",
+  "datasetPreprocessing": {
+    "target_column": {
+      "type": "string",
+      "kind": "length",
+      "description": "Name of the categorical column Mitra classifies. Its distinct values are the class labels (2–10 classes). Every other non-dropped column is a feature.",
+      "minLength": 1,
+      "maxLength": 128,
+      "default": "target"
+    },
+    "drop_columns": {
+      "type": "string",
+      "kind": "length",
+      "description": "Comma-separated columns to exclude from features (e.g. ids, dates already encoded). Leave blank to keep all.",
+      "minLength": 0,
+      "maxLength": 512,
+      "default": ""
+    },
+    "max_train_rows": {
+      "type": "integer",
+      "kind": "range",
+      "description": "Cap on training rows. Mitra's hard upstream ceiling is 10000; larger tables are seed-sampled down.",
+      "minimum": 100,
+      "maximum": 10000,
+      "default": 10000
+    },
+    "validation_split": {
+      "type": "number",
+      "kind": "range",
+      "description": "Fraction of train held out for the reported accuracy when the zip has no val.csv.",
+      "minimum": 0.0,
+      "maximum": 0.4,
+      "default": 0.2
+    }
+  },
+  "modelFinetuning": {
+    "time_limit_seconds": {
+      "type": "integer",
+      "kind": "range",
+      "description": "AutoGluon fit time budget in seconds.",
+      "minimum": 30,
+      "maximum": 3600,
+      "default": 600
+    },
+    "seed": {
+      "type": "integer",
+      "kind": "range",
+      "description": "RNG seed. Mitra's fit is stochastic; pin this for reproducible runs.",
+      "minimum": 0,
+      "maximum": 2147483647,
+      "default": 0
+    },
+    "eval_metric": {
+      "type": "string",
+      "kind": "enum",
+      "description": "Metric AutoGluon optimizes and reports. All listed metrics apply to binary and multiclass targets.",
+      "enum": ["accuracy", "balanced_accuracy", "log_loss", "f1_macro", "mcc"],
+      "default": "accuracy"
+    },
+    "fine_tune": {
+      "type": "boolean",
+      "kind": "boolean",
+      "description": "Fine-tune Mitra's weights (needs a GPU) versus zero-shot in-context inference. On a CPU instance the pipeline runs zero-shot regardless of this setting.",
+      "default": true
+    },
+    "fine_tune_steps": {
+      "type": "integer",
+      "kind": "range",
+      "description": "Number of fine-tuning steps when fine_tune is on. 0 uses AutoGluon's default. Ignored for zero-shot.",
+      "minimum": 0,
+      "maximum": 100,
+      "default": 0
+    }
+  }
+}
