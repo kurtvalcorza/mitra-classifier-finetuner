@@ -1,6 +1,8 @@
 # Finetuner deps. The [mitra] extra pulls Mitra's runtime dependencies (omegaconf,
 # huggingface_hub, and the Mitra model code); plain autogluon.tabular does NOT include them,
 # and Mitra fails to import at fit time. torch comes from the CUDA base image.
+# scikit-learn (stratified split/cap) and huggingface_hub (weights resolution) are provided,
+# version-pinned, by autogluon.tabular[mitra]==1.5.0 — do not re-pin them here and risk a clash.
 autogluon.tabular[mitra]==1.5.0
 pandas==2.2.3
 numpy==1.26.4
