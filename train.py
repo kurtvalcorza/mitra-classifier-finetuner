@@ -56,8 +56,22 @@ MIN_ROWS_FOR_SPLIT = 20   # below this, don't carve a holdout out of train
 # Keep this block byte-identical across the validator and finetuner containers.
 # The CI parity check (scripts/check_shared.py) enforces it.
 # ============================================================================
-MAX_TOTAL_UNCOMPRESSED_BYTES = int(os.getenv("DIMER_MAX_UNCOMPRESSED_BYTES", str(4 * 1024**3)))
-MAX_COMPRESSION_RATIO = float(os.getenv("DIMER_MAX_COMPRESSION_RATIO", "200"))
+def _safe_int(value: str | None, default: int) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: str | None, default: float) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_TOTAL_UNCOMPRESSED_BYTES = _safe_int(os.getenv("DIMER_MAX_UNCOMPRESSED_BYTES"), 4 * 1024**3)
+MAX_COMPRESSION_RATIO = _safe_float(os.getenv("DIMER_MAX_COMPRESSION_RATIO"), 200.0)
 _DATASET_DIR_ALIASES = {"dataset", "datasets"}
 
 
@@ -397,17 +411,32 @@ def _stratified_cap(train: pd.DataFrame, target_col: str, ceiling: int, seed: in
 
 def _stratified_holdout(train: pd.DataFrame, target_col: str, val_frac: float,
                         seed: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Carve a stratified holdout so every class stays represented in train."""
+    """Carve a stratified holdout so every class stays represented in both train and val.
+
+    The requested fraction is converted to an integer holdout size clamped so that both splits
+    can hold every class: a scikit-learn stratified split requires the validation size and the
+    training size to each be at least the class count. A fraction too small to satisfy that
+    (e.g. 50 rows, 10 classes, split 0.05) is raised as a clear error rather than crashing deep
+    in scikit-learn."""
     from sklearn.model_selection import train_test_split
 
     counts = train[target_col].value_counts()
+    n_classes = int(counts.size)
     if (counts < 2).any():
         raise ValueError(
             f"class(es) with fewer than 2 rows cannot be split: "
             f"{counts[counts < 2].to_dict()}"
         )
+    n = len(train)
+    n_val = int(round(n * val_frac))
+    n_val = min(max(n_val, n_classes), n - n_classes)  # val >= classes AND train >= classes
+    if n_val < n_classes or n - n_val < n_classes:
+        raise ValueError(
+            f"cannot build a stratified holdout: {n} usable rows, {n_classes} classes, "
+            f"validation_split={val_frac}. Provide more rows, fewer classes, or a larger split."
+        )
     tr, va = train_test_split(
-        train, test_size=val_frac, random_state=seed, stratify=train[target_col]
+        train, test_size=n_val, random_state=seed, stratify=train[target_col]
     )
     if set(tr[target_col].unique()) != set(train[target_col].unique()):
         raise RuntimeError("stratified split left a class out of train; refusing to train.")
@@ -424,7 +453,8 @@ def _prepare_frames(cfg: Config, source: DatasetSource) -> tuple[pd.DataFrame, p
     if cfg.target_column not in train.columns:
         raise KeyError(f"target column '{cfg.target_column}' not in {list(train.columns)}")
 
-    drop = [c for c in cfg.drop_columns if c in train.columns]
+    # Never drop the target, even if a malformed config lists it in drop_columns.
+    drop = [c for c in cfg.drop_columns if c in train.columns and c != cfg.target_column]
     train = train.drop(columns=drop).dropna(subset=[cfg.target_column])
 
     classes_all = set(train[cfg.target_column].unique())
@@ -441,8 +471,8 @@ def _prepare_frames(cfg: Config, source: DatasetSource) -> tuple[pd.DataFrame, p
         )
 
     def _prep_holdout(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.drop(columns=[c for c in cfg.drop_columns if c in df.columns])
-        return df.dropna(subset=[cfg.target_column])
+        cols = [c for c in cfg.drop_columns if c in df.columns and c != cfg.target_column]
+        return df.drop(columns=cols).dropna(subset=[cfg.target_column])
 
     val_path = source.resolve_single("val")
     if val_path is not None:
@@ -478,8 +508,11 @@ def _evaluate(cfg: Config, predictor, frame: pd.DataFrame) -> dict[str, Any]:
         frame = frame.sample(n=cfg.max_eval_rows, random_state=cfg.seed)
     out: dict[str, Any] = {"rows": int(len(frame))}
     try:
+        raw = predictor.evaluate(frame, auxiliary_metrics=True, silent=True)
+        # AutoGluon reports higher-is-better and sign-flips loss metrics; present log_loss in
+        # its conventional positive (lower-is-better) form for downstream consumers.
         out["evaluation"] = {
-            k: float(v) for k, v in predictor.evaluate(frame, auxiliary_metrics=True, silent=True).items()
+            k: float(-v if "log_loss" in k else v) for k, v in raw.items()
         }
     except Exception as exc:  # noqa: BLE001
         out["evaluationError"] = str(exc)

@@ -109,3 +109,37 @@ def test_uploaded_weights_installed_and_resolvable(tmp_path, monkeypatch):
     from huggingface_hub import hf_hub_download
     path = hf_hub_download(T.BASE_MODEL, "model.safetensors")
     assert Path(path).read_bytes() == b"FAKE_WEIGHTS_BYTES"
+
+
+def test_stratified_holdout_small_fraction_many_classes():
+    # 50 rows, 10 classes, split 0.05 -> would crash a naive stratified split; must not here.
+    train = _frame({f"c{i}": 5 for i in range(10)})
+    tr, va = T._stratified_holdout(train, "target", 0.05, 0)
+    assert set(tr["target"]) == set(f"c{i}" for i in range(10))
+    assert set(va["target"]) == set(f"c{i}" for i in range(10))
+
+
+def test_stratified_holdout_class_too_small_raises():
+    train = _frame({f"c{i}": 1 for i in range(10)})  # a class with only 1 row can't be split
+    with pytest.raises(ValueError):
+        T._stratified_holdout(train, "target", 0.2, 0)
+
+
+def test_finetuner_never_drops_target(tmp_path):
+    _zip(tmp_path, {"train.csv": _frame({"a": 40, "b": 40, "c": 40})})
+    src = T.DatasetSource(tmp_path)
+    try:
+        # target listed in drop_columns must not cause a KeyError; the target survives.
+        train, val, test, n = T._prepare_frames(_cfg(tmp_path, drop_columns=["target", "f1"]), src)
+    finally:
+        src.close()
+    assert "target" in train.columns and n == 3
+
+
+def test_log_loss_sign_normalized(tmp_path):
+    class _FakePredictor:
+        def evaluate(self, frame, auxiliary_metrics=True, silent=True):
+            return {"log_loss": -0.5, "accuracy": 0.7}  # AutoGluon returns negated log_loss
+    out = T._evaluate(_cfg(tmp_path), _FakePredictor(), pd.DataFrame({"target": ["a", "b"]}))
+    assert out["evaluation"]["log_loss"] == 0.5   # normalized to conventional positive
+    assert out["evaluation"]["accuracy"] == 0.7
