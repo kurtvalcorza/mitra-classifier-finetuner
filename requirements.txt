@@ -1,6 +1,10 @@
 # Finetuner deps. The [mitra] extra pulls Mitra's runtime dependencies (omegaconf,
 # huggingface_hub, and the Mitra model code); plain autogluon.tabular does NOT include them,
-# and Mitra fails to import at fit time. torch comes from the CUDA base image.
+# and Mitra fails to import at fit time.
+# torch/CUDA are pinned by the base image tag (pytorch:2.8.0-cuda12.8), which satisfies
+# AutoGluon 1.5.0's torch>=2.6,<2.10 range — so pip keeps that exact cu128 build instead of a
+# PyPI-default wheel. Do NOT re-pin torch here: a bare "torch==2.8" lets pip replace the cu128
+# build with a cu-default one and break sm_120. The Dockerfile asserts the locked torch/CUDA.
 # scikit-learn (stratified split/cap) and huggingface_hub (weights resolution) are provided,
 # version-pinned, by autogluon.tabular[mitra]==1.5.0 — do not re-pin them here and risk a clash.
 autogluon.tabular[mitra]==1.5.0

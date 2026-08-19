@@ -16,5 +16,7 @@ jobs:
       - run: pip install pandas numpy scikit-learn huggingface_hub requests pytest
       - name: Compile
         run: python -m py_compile train.py
+      - name: Shared block (cross-repo parity)
+        run: python scripts/check_shared.py
       - name: Unit tests
         run: python -m pytest tests/ -q

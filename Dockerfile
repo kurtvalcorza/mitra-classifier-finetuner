@@ -1,9 +1,12 @@
 # DIMER finetuner — Mitra tabular classification (GPU image, with CPU fallback).
-# AutoGluon's Mitra runs on torch/CUDA; use a CUDA runtime base so the 5070 Ti / cluster
-# GPU is usable. Match the CUDA minor to the cluster's driver. train.py detects the GPU at
-# runtime, so this image also runs on a CPU-only node (zero-shot). For a lean CPU-only image
-# instead, use Dockerfile.cpu.
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+# CUDA 12.8 / torch 2.8 base: ships sm_120 (Blackwell, e.g. RTX 5070 Ti) kernels plus
+# sm_70–sm_100, and satisfies AutoGluon 1.5.0's torch>=2.6,<2.10 requirement — so pip does
+# NOT silently swap the base image's torch at install time. Do NOT downgrade to
+# cuda12.4/torch2.5: that build lacks sm_120 and dies with "no kernel image is available" on
+# RTX 50-series / B200 GPUs, and AutoGluon would upgrade torch anyway. train.py detects the
+# GPU at runtime, so this image also runs on a CPU-only node (zero-shot); for a lean CPU-only
+# image instead, use Dockerfile.cpu.
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 WORKDIR /app
 
@@ -14,6 +17,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Lock the actual installed stack: fail the build if pip swapped torch/CUDA out of the tested
+# range (AutoGluon manages torch, so this catches a silent dependency drift at build time).
+RUN python -c "import torch; v=torch.__version__; c=torch.version.cuda; \
+    assert v.startswith('2.8'), 'unexpected torch '+v; \
+    assert c and c.startswith('12.8'), 'unexpected CUDA '+str(c); \
+    print('locked torch', v, 'CUDA', c)"
 
 # OPTION A (recommended for reproducibility): bake pinned Mitra weights into the image so
 # runs never depend on a network fetch and cannot drift between builds.

@@ -104,6 +104,7 @@ def test_uploaded_weights_installed_and_resolvable(tmp_path, monkeypatch):
     prov = T.resolve_and_verify_weights(_cfg(tmp_path, model_dir=model_dir))
     assert prov["source"] == "uploaded"
     assert prov["weightsSha256"]
+    assert prov.get("configSha256")  # finding 3: config.json is hashed too
 
     # The loader (hf_hub_download on the repo id, offline) now resolves to the uploaded bytes.
     from huggingface_hub import hf_hub_download
@@ -143,3 +144,41 @@ def test_log_loss_sign_normalized(tmp_path):
     out = T._evaluate(_cfg(tmp_path), _FakePredictor(), pd.DataFrame({"target": ["a", "b"]}))
     assert out["evaluation"]["log_loss"] == 0.5   # normalized to conventional positive
     assert out["evaluation"]["accuracy"] == 0.7
+
+
+def test_mitra_metric_map():
+    assert T._mitra_metric("accuracy") == "accuracy"
+    assert T._mitra_metric("ROC_AUC") == "roc_auc"
+    assert T._mitra_metric("auc") == "roc_auc"
+    assert T._mitra_metric("log_loss") == "log_loss"
+    assert T._mitra_metric("f1") is None  # unmapped -> Mitra default
+
+
+def test_member_byte_cap_zip(tmp_path, monkeypatch):
+    monkeypatch.setattr(T, "MAX_MEMBER_UNCOMPRESSED_BYTES", 100)  # smaller than the CSV
+    _zip(tmp_path, {"train.csv": _frame({"a": 40, "b": 40})})
+    with pytest.raises(ValueError):
+        T.DatasetSource(tmp_path)
+
+
+def test_row_ceiling_rejected_not_truncated(tmp_path, monkeypatch):
+    monkeypatch.setattr(T, "MAX_CSV_ROWS", 10)
+    monkeypatch.setattr(T, "CSV_READ_CHUNK_ROWS", 4)
+    _zip(tmp_path, {"train.csv": _frame({"a": 40, "b": 40})})  # 80 rows > ceiling of 10
+    src = T.DatasetSource(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            src.read_csv("train.csv")
+    finally:
+        src.close()
+
+
+def test_directory_mode_byte_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(T, "MAX_MEMBER_UNCOMPRESSED_BYTES", 50)
+    _frame({"a": 40, "b": 40}).to_csv(tmp_path / "train.csv", index=False)  # no zip
+    src = T.DatasetSource(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            src.read_csv("train.csv")
+    finally:
+        src.close()

@@ -45,6 +45,9 @@ BASE_MODEL = "autogluon/mitra-classifier"
 # against this checksum before fitting; a mismatch fails the run.
 PINNED_MITRA_REVISION = "c425e9fa0910a6be1c494321792e7ba2a1367b1a"
 EXPECTED_WEIGHTS_SHA256 = "e06a055e91a3baeffc37f9cf634d9e69a27d904b6686131dc3b702f9c0126b19"
+# config.json is checksum-enforced too: it carries the architecture Mitra builds before loading
+# the weights, so a drifted config with matching weights would still change the model.
+EXPECTED_CONFIG_SHA256 = "2c96c24dd25f64e92753f6f2ba00cc7833b9923459403dcd8504e8700c0995df"
 
 MITRA_MODEL_KEY = "MITRA"
 MITRA_ROW_LIMIT = 10_000  # hard upstream ceiling
@@ -72,6 +75,13 @@ def _safe_float(value: str | None, default: float) -> float:
 
 MAX_TOTAL_UNCOMPRESSED_BYTES = _safe_int(os.getenv("DIMER_MAX_UNCOMPRESSED_BYTES"), 4 * 1024**3)
 MAX_COMPRESSION_RATIO = _safe_float(os.getenv("DIMER_MAX_COMPRESSION_RATIO"), 200.0)
+# Per-file uncompressed-byte ceiling and a full-read row ceiling. These bound memory BEFORE
+# pandas materializes a table, and — unlike the zip-bomb guard — also apply to directory-mode
+# inputs. An over-limit table is rejected, never silently truncated (truncation would corrupt
+# the validator's row/usable counts and the finetuner's class-preservation guarantees).
+MAX_MEMBER_UNCOMPRESSED_BYTES = _safe_int(os.getenv("DIMER_MAX_MEMBER_BYTES"), 1 * 1024**3)
+MAX_CSV_ROWS = _safe_int(os.getenv("DIMER_MAX_CSV_ROWS"), 5_000_000)
+CSV_READ_CHUNK_ROWS = _safe_int(os.getenv("DIMER_CSV_CHUNK_ROWS"), 200_000)
 _DATASET_DIR_ALIASES = {"dataset", "datasets"}
 
 
@@ -96,6 +106,11 @@ def _assert_zip_safe(zf: zipfile.ZipFile) -> None:
         if info.is_dir():
             continue
         total += info.file_size
+        if info.file_size > MAX_MEMBER_UNCOMPRESSED_BYTES:
+            raise ValueError(
+                f"archive member {info.filename!r} is {info.file_size:,} uncompressed bytes "
+                f"(> {MAX_MEMBER_UNCOMPRESSED_BYTES:,}); refusing (per-file guard)"
+            )
         if info.compress_size > 0:
             ratio = info.file_size / info.compress_size
             if ratio > MAX_COMPRESSION_RATIO:
@@ -176,9 +191,43 @@ class DatasetSource:
             return self._zip.open(raw)  # ZipExtFile — streams, no full-member read
         return open(raw, "rb")
 
+    def _member_bytes(self, normalized: str) -> int:
+        raw = self._members[normalized][0]
+        if self._zip is not None:
+            return self._zip.getinfo(raw).file_size
+        return os.path.getsize(raw)
+
+    def _guard_size(self, normalized: str) -> None:
+        """Reject an oversized member/file before pandas materializes it. Covers directory-mode
+        inputs too (the zip-bomb guard only sees archives)."""
+        size = self._member_bytes(normalized)
+        if size > MAX_MEMBER_UNCOMPRESSED_BYTES:
+            raise ValueError(
+                f"{normalized}: {size:,} uncompressed bytes exceeds the per-file limit "
+                f"{MAX_MEMBER_UNCOMPRESSED_BYTES:,} (DIMER_MAX_MEMBER_BYTES); refusing to load."
+            )
+
     def read_csv(self, normalized: str, nrows: int | None = None) -> pd.DataFrame:
+        """Read a CSV member with memory bounded before materialization: a raw-byte ceiling per
+        file, and — for a full read — a chunked parse that refuses to build a frame past
+        MAX_CSV_ROWS rather than OOM on a hostile or accidental giant table. Rows are never
+        silently dropped: an over-limit table is rejected, not truncated."""
+        self._guard_size(normalized)
+        if nrows is not None:
+            with self.open(normalized) as handle:
+                return pd.read_csv(handle, nrows=nrows)
         with self.open(normalized) as handle:
-            return pd.read_csv(handle, nrows=nrows)
+            chunks: list[pd.DataFrame] = []
+            rows = 0
+            for chunk in pd.read_csv(handle, chunksize=CSV_READ_CHUNK_ROWS):
+                rows += len(chunk)
+                if rows > MAX_CSV_ROWS:
+                    raise ValueError(
+                        f"{normalized}: exceeds the {MAX_CSV_ROWS:,}-row read ceiling "
+                        f"(DIMER_MAX_CSV_ROWS); refusing to load the whole table into memory."
+                    )
+                chunks.append(chunk)
+        return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
     def close(self) -> None:
         if self._zip is not None:
@@ -343,14 +392,16 @@ def resolve_and_verify_weights(cfg: Config) -> dict[str, Any]:
         "baseModel": BASE_MODEL,
         "baseModelRevisionExpected": cfg.required_revision,
         "expectedSha256": EXPECTED_WEIGHTS_SHA256,
+        "expectedConfigSha256": EXPECTED_CONFIG_SHA256,
     }
     if cfg.model_dir is not None:
         # _install sets HF_HUB_OFFLINE=1 before huggingface_hub is first imported (it reads the
         # flag at import time), so AutoGluon's loader serves the uploaded bytes from the cache.
         commit, sha = _install_uploaded_weights(cfg.model_dir)
+        config_sha = _sha256_file(str(cfg.model_dir / "config.json"))
         prov.update({
             "source": "uploaded", "baseModelRevision": commit, "weightsSha256": sha,
-            "enforced": False,
+            "configSha256": config_sha, "enforced": False,
             "note": "Uploaded weights used verbatim; not checked against the public pinned checksum.",
         })
         return prov
@@ -359,17 +410,25 @@ def resolve_and_verify_weights(cfg: Config) -> dict[str, Any]:
 
     # Resolve exactly as Mitra's from_pretrained does: hf_hub_download(repo, filename) on main.
     loaded = hf_hub_download(BASE_MODEL, "model.safetensors")
+    config_path = hf_hub_download(BASE_MODEL, "config.json")
     commit = _snapshot_commit_from_path(loaded)
     sha = _sha256_file(loaded)
+    config_sha = _sha256_file(config_path)
     prov.update({
         "source": "huggingface", "baseModelRevision": commit, "weightsSha256": sha,
-        "enforced": True,
+        "configSha256": config_sha, "enforced": True,
     })
     if cfg.required_revision == PINNED_MITRA_REVISION and sha != EXPECTED_WEIGHTS_SHA256:
         raise RuntimeError(
             f"Mitra weights to load have SHA-256 {sha}, expected {EXPECTED_WEIGHTS_SHA256} for "
             f"pinned revision {PINNED_MITRA_REVISION}. The hub 'main' may have drifted. Bake the "
             f"pinned revision into the image (Dockerfile Option A) or set DIMER_MITRA_REVISION."
+        )
+    if cfg.required_revision == PINNED_MITRA_REVISION and config_sha != EXPECTED_CONFIG_SHA256:
+        raise RuntimeError(
+            f"Mitra config.json has SHA-256 {config_sha}, expected {EXPECTED_CONFIG_SHA256} for "
+            f"pinned revision {PINNED_MITRA_REVISION}. The hub 'main' may have drifted; bake the "
+            f"pinned revision (Dockerfile Option A) or set DIMER_MITRA_REVISION."
         )
     if commit and cfg.required_revision and commit != cfg.required_revision:
         raise RuntimeError(
@@ -519,6 +578,19 @@ def _evaluate(cfg: Config, predictor, frame: pd.DataFrame) -> dict[str, Any]:
     return out
 
 
+# DIMER/AutoGluon eval-metric name -> Mitra's native early-stopping metric. Unmapped names
+# fall back to Mitra's default and only drive AutoGluon's reported metric.
+_MITRA_METRIC_MAP = {
+    "log_loss": "log_loss",
+    "accuracy": "accuracy", "acc": "accuracy",
+    "roc_auc": "roc_auc", "auc": "roc_auc",
+}
+
+
+def _mitra_metric(name: str) -> str | None:
+    return _MITRA_METRIC_MAP.get(name.strip().lower())
+
+
 def _fit_and_evaluate(cfg: Config, train: pd.DataFrame, val: pd.DataFrame,
                       test: pd.DataFrame | None, num_classes: int) -> dict[str, Any]:
     requested_cpu = cfg.train_device.lower() == "cpu"
@@ -538,9 +610,20 @@ def _fit_and_evaluate(cfg: Config, train: pd.DataFrame, val: pd.DataFrame,
         why = "no GPU is available" if not gpu_available else "CPU was requested"
         log(f"Running zero-shot (fine_tune=False): {why}; Mitra fine-tuning requires a GPU.")
         fine_tune = False
-    mitra_hp: dict[str, Any] = {"fine_tune": fine_tune}
+    # Propagate the run seed and (when mappable) the eval metric into Mitra itself, not just
+    # AutoGluon's reporting: "seed" seeds Mitra's val-split/augmentation RNG (ConfigRun.seed),
+    # and "metric" drives its fine-tune early-stopping. NOTE: AutoGluon 1.5.0's Mitra disables
+    # its global set_seed (an upstream FIXME), so a fixed seed makes the internal split
+    # reproducible but not the full fit — a known upstream limit, not a bug here.
+    mitra_hp: dict[str, Any] = {"fine_tune": fine_tune, "seed": cfg.seed}
     if fine_tune and cfg.fine_tune_steps:
         mitra_hp["fine_tune_steps"] = cfg.fine_tune_steps
+    mitra_metric = _mitra_metric(cfg.eval_metric)
+    if mitra_metric is not None:
+        mitra_hp["metric"] = mitra_metric
+    else:
+        log(f"eval_metric '{cfg.eval_metric}' has no Mitra-native early-stopping equivalent; "
+            f"Mitra keeps its default metric (AutoGluon still reports '{cfg.eval_metric}').")
 
     problem_type = "binary" if num_classes == 2 else "multiclass"
 
@@ -585,6 +668,8 @@ def _fit_and_evaluate(cfg: Config, train: pd.DataFrame, val: pd.DataFrame,
         "mode": "fine-tune" if fine_tune else "zero-shot",
         "device": "cuda" if use_gpu else "cpu",
         "evalMetric": cfg.eval_metric,
+        "mitraMetric": mitra_metric or "<mitra-default>",
+        "mitraSeed": cfg.seed,
     }
     # Transparency: the holdout size can differ from the requested fraction — the stratified
     # split widens a too-small fraction to fit every class, and size caps can shift it too.

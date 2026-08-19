@@ -1,0 +1,41 @@
+name: integration
+
+# Real-stack GPU smoke test (finding: CI never exercises the actual ML/runtime stack). Unlike
+# the fast unit suite, this builds the image, loads Mitra offline, fine-tunes a tiny model,
+# saves it, reloads the predictor, and predicts — catching torch/base-image drift, Mitra API
+# changes, offline-weight failures, and seed/metric propagation.
+#
+# It needs a self-hosted GPU runner labelled 'gpu' with the NVIDIA Container Toolkit. Manual
+# "Run workflow" always runs; the nightly schedule is skipped unless the repo variable
+# ENABLE_NIGHTLY_GPU is set to 'true', so an unattached runner never queues or fails a build.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 18 * * *"
+
+jobs:
+  mitra-smoke:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.ENABLE_NIGHTLY_GPU == 'true' }}
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 45
+    env:
+      IMAGE: mitra-classifier-ft:ci
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (also asserts torch 2.8 / CUDA 12.8)
+        run: docker build -t "$IMAGE" .
+      - name: Fetch pinned Mitra weights once (network)
+        run: |
+          mkdir -p snap
+          docker run --rm -v "$PWD/snap:/snap" "$IMAGE" \
+            python -c "import shutil,os; from huggingface_hub import snapshot_download; \
+            d=snapshot_download('autogluon/mitra-classifier', revision='c425e9fa0910a6be1c494321792e7ba2a1367b1a'); \
+            [shutil.copy(os.path.join(d,f),'/snap/'+f) for f in ('model.safetensors','config.json')]; \
+            print('baked', os.listdir('/snap'))"
+      - name: Offline load + fit + save + reload + predict
+        run: |
+          docker run --rm --gpus all \
+            -e HF_HUB_OFFLINE=1 \
+            -v "$PWD:/work" -w /work \
+            -v "$PWD/snap:/snap:ro" \
+            "$IMAGE" python scripts/integration_smoke.py --weights /snap
