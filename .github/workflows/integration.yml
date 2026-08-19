@@ -10,8 +10,10 @@ name: integration
 # ENABLE_NIGHTLY_GPU is set to 'true', so an unattached runner never queues or fails a build.
 on:
   workflow_dispatch:
+  # Staggered 1h after the regressor repo's nightly so the two self-hosted GPU runners never
+  # contend for the same GPU (each finetuner repo has its own runner on the shared host).
   schedule:
-    - cron: "0 18 * * *"
+    - cron: "0 19 * * *"
 
 jobs:
   mitra-smoke:
