@@ -586,9 +586,15 @@ def _fit_and_evaluate(cfg: Config, train: pd.DataFrame, val: pd.DataFrame,
         "device": "cuda" if use_gpu else "cpu",
         "evalMetric": cfg.eval_metric,
     }
+    # Transparency: the holdout size can differ from the requested fraction — the stratified
+    # split widens a too-small fraction to fit every class, and size caps can shift it too.
+    metrics["requestedValidationSplit"] = cfg.validation_split
     if len(val) > 0:
         val_eval = _evaluate(cfg, predictor, val)
         metrics["valRows"] = val_eval["rows"]
+        metrics["effectiveValidationRows"] = int(len(val))
+        denom = metrics["trainRows"] + int(len(val))
+        metrics["effectiveValidationSplit"] = round(int(len(val)) / denom, 4) if denom else 0.0
         evaluation = val_eval.get("evaluation", {})
         metrics["valEvaluation"] = evaluation
         if "evaluationError" in val_eval:
