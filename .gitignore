@@ -6,3 +6,12 @@ __pycache__/
 desktop.ini
 *.egg-info/
 out/
+# Local dataset / result / base-model artifacts (never committed).
+weights/
+*.safetensors
+*.csv
+*.zip
+data/
+datasets/
+results/
+result.json
