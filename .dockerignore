@@ -1,0 +1,30 @@
+# Keep the DIMER CodeBuild context minimal: only requirements.txt + train.py are
+# COPYed into the image (dimer-pipeline.json is read by the platform from the
+# repo, not baked into the image). Everything below is local-only — dev caches,
+# tests, docs, and any dataset/result/model artifacts — and must never enter the
+# build context.
+.git
+.github
+.gitignore
+.dockerignore
+docs/
+scripts/
+tests/
+examples/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+desktop.ini
+out/
+# Base-model weights and local dataset / result artifacts (never part of a build).
+weights/
+*.safetensors
+*.csv
+*.zip
+data/
+datasets/
+results/
+result.json
