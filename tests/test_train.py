@@ -199,3 +199,45 @@ def test_normalize_device():
     assert T._normalize_device(None) == "cuda:0"
     assert T._normalize_device("mps") == "cpu"       # unknown accelerator -> safe CPU fallback
     assert T._normalize_device("cuda:x") == "cpu"    # malformed index -> CPU fallback
+
+
+class _FakePost:
+    """Records callback POST URLs and returns a minimal ok response (stands in for requests.post)."""
+
+    def __init__(self):
+        self.urls: list[str] = []
+
+    def __call__(self, url, timeout=None):
+        self.urls.append(url)
+        return type("_Resp", (), {"ok": True, "status_code": 200})()
+
+
+def test_config_error_still_notifies_callback(tmp_path, monkeypatch):
+    """A config-parse failure must still POST the done callback, or the UI hangs at the train stage."""
+    fake = _FakePost()
+    monkeypatch.setattr(T.requests, "post", fake)
+    monkeypatch.setenv("DIMER_RESULT_PATH", str(tmp_path / "result.json"))
+    monkeypatch.setenv("DIMER_DONE_CALLBACK", "http://backend/done")
+    monkeypatch.setenv("DIMER_HYPERPARAMETERS_JSON", "{not valid json")   # load_config raises
+    assert T.main() == 1
+    assert fake.urls == ["http://backend/done"]
+
+
+def test_write_failure_still_notifies_callback(tmp_path, monkeypatch):
+    """A crash plus a result-write failure must still POST the callback (decoupled from the write)."""
+    fake = _FakePost()
+    monkeypatch.setattr(T.requests, "post", fake)
+
+    def _run_boom(cfg):
+        raise RuntimeError("fit crashed")
+
+    def _write_boom(cfg, payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(T, "run", _run_boom)
+    monkeypatch.setattr(T, "write_result", _write_boom)
+    monkeypatch.setenv("DIMER_DATASET_DIR", str(tmp_path))
+    monkeypatch.setenv("DIMER_RESULT_PATH", str(tmp_path / "result.json"))
+    monkeypatch.setenv("DIMER_DONE_CALLBACK", "http://backend/done")
+    assert T.main() == 1
+    assert fake.urls == ["http://backend/done"]

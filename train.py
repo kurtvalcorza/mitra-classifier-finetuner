@@ -309,17 +309,33 @@ def write_result(cfg: Config, payload: dict[str, Any]) -> None:
     cfg.result_path.write_text(content, encoding="utf-8")
 
 
-def notify_done_callback(cfg: Config) -> dict[str, Any]:
-    if not cfg.done_callback:
+def _post_done_callback(callback: str, timeout: float) -> dict[str, Any]:
+    """POST the DIMER done callback. Shared by the Config-based and env-based notifiers so the
+    normal path and the config-parse-failure path report completion identically."""
+    if not callback:
         return {"attempted": False, "message": "DIMER_DONE_CALLBACK not set; skipping."}
-    parsed = urlparse(cfg.done_callback)
+    parsed = urlparse(callback)
     if parsed.scheme not in {"http", "https"}:
         return {"attempted": False, "message": f"Unsupported scheme: {parsed.scheme}"}
     try:
-        response = requests.post(cfg.done_callback, timeout=cfg.callback_timeout)
+        response = requests.post(callback, timeout=timeout)
         return {"attempted": True, "ok": response.ok, "statusCode": response.status_code}
     except requests.RequestException as exc:
         return {"attempted": True, "ok": False, "error": str(exc)}
+
+
+def notify_done_callback(cfg: Config) -> dict[str, Any]:
+    return _post_done_callback(cfg.done_callback, cfg.callback_timeout)
+
+
+def _notify_from_env() -> dict[str, Any]:
+    """Best-effort done callback when config parsing failed and no Config exists: read the URL
+    and timeout straight from the environment so the backend is still notified and the Workbench
+    UI never hangs."""
+    return _post_done_callback(
+        os.getenv("DIMER_DONE_CALLBACK", "").strip(),
+        _safe_float(os.getenv("DIMER_CALLBACK_TIMEOUT_SECONDS"), 10.0),
+    )
 
 
 def _seed_everything(seed: int) -> None:
@@ -768,7 +784,9 @@ def run(cfg: Config) -> int:
         },
     }
     write_result(cfg, payload)
-    log(f"Callback: {json.dumps(notify_done_callback(cfg), sort_keys=True)}")
+    # The done callback fires exactly once, unconditionally, in main()'s finally — which also
+    # covers a write_result failure here and the config-parse-failure path. Calling it here too
+    # would double-notify on the success path.
     return 0
 
 
@@ -801,37 +819,54 @@ def _failure_provenance(cfg: Config | None) -> dict[str, Any]:
     return prov
 
 
+def _persist_failure(cfg: Config | None, exc: Exception) -> None:
+    """Write a structured failure result.json. Uses the full write path when a Config exists;
+    falls back to a direct env-addressed write when config parsing itself failed. Best-effort —
+    a persistence failure is logged, never raised, so the done callback in main()'s finally
+    still fires."""
+    payload: dict[str, Any] = {
+        "successful": False,
+        "message": f"Mitra fine-tuning failed: {exc}",
+        "error": {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        },
+        "provenance": _failure_provenance(cfg),
+        "metadata": {
+            "template": TEMPLATE_NAME,
+            "taskType": (cfg.default_task_type if cfg else "tabular_classification"),
+        },
+    }
+    try:
+        if cfg is not None:
+            write_result(cfg, payload)
+        else:
+            fallback = Path(os.getenv("DIMER_RESULT_PATH", "/data/results/result.json"))
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            fallback.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except Exception as write_exc:  # noqa: BLE001
+        log(f"Failed to persist failure result: {write_exc}")
+
+
 def main() -> int:
+    """Guarantee the DIMER done callback on EVERY exit path (success, runtime crash, config-parse
+    error, and result-write failure) via a finally, so the Workbench UI never hangs. The callback
+    is decoupled from a successful result write."""
     cfg: Config | None = None
     try:
         cfg = load_config()
         return run(cfg)
-    except Exception as exc:  # noqa: BLE001
-        payload = {
-            "successful": False,
-            "message": f"Mitra fine-tuning failed: {exc}",
-            "error": {
-                "type": type(exc).__name__,
-                "message": str(exc),
-                "traceback": traceback.format_exc(),
-            },
-            "provenance": _failure_provenance(cfg),
-            "metadata": {
-                "template": TEMPLATE_NAME,
-                "taskType": (cfg.default_task_type if cfg else "tabular_classification"),
-            },
-        }
-        try:
-            if cfg is not None:
-                write_result(cfg, payload)
-                notify_done_callback(cfg)
-            else:
-                fallback = Path(os.getenv("DIMER_RESULT_PATH", "/data/results/result.json"))
-                fallback.parent.mkdir(parents=True, exist_ok=True)
-                fallback.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        except Exception as write_exc:  # noqa: BLE001
-            log(f"Failed to persist crash result: {write_exc}")
+    except Exception as exc:  # noqa: BLE001 - config-parse or run() crash
+        log(f"Fine-tuning failed ({type(exc).__name__}): {exc}")
+        _persist_failure(cfg, exc)
         return 1
+    finally:
+        try:
+            result = notify_done_callback(cfg) if cfg is not None else _notify_from_env()
+            log(f"Callback: {json.dumps(result, sort_keys=True)}")
+        except Exception as cb_exc:  # noqa: BLE001 - the callback must never mask the real exit
+            log(f"Done callback failed: {cb_exc}")
 
 
 if __name__ == "__main__":
