@@ -591,11 +591,41 @@ def _mitra_metric(name: str) -> str | None:
     return _MITRA_METRIC_MAP.get(name.strip().lower())
 
 
+def _normalize_device(raw: str | None) -> str:
+    """Normalize DIMER_TRAIN_DEVICE to canonical 'cpu' or 'cuda:<index>'.
+
+    DIMER injects 'cuda:0' or 'cpu', but the engineering docs call out that a bare integer like
+    '0' can arrive and must be read as 'cuda:0' (torch.device('0') is an invalid device string).
+    An explicit CUDA index is preserved and honored; the common spellings 'gpu'/'cuda' map to
+    'cuda:0'. An unrecognized value falls back to CPU — the always-available device — so the run
+    still completes and reports a result instead of crashing on a bad device string."""
+    value = (raw or "").strip().lower()
+    if value == "cpu":
+        return "cpu"
+    if value in ("", "gpu", "cuda"):
+        return "cuda:0"
+    if value.isdigit():
+        return f"cuda:{int(value)}"
+    if value.startswith("cuda:"):
+        index = value.split(":", 1)[1]
+        if index.isdigit():
+            return f"cuda:{int(index)}"
+    return "cpu"
+
+
 def _fit_and_evaluate(cfg: Config, train: pd.DataFrame, val: pd.DataFrame,
                       test: pd.DataFrame | None, num_classes: int) -> dict[str, Any]:
-    requested_cpu = cfg.train_device.lower() == "cpu"
+    device = _normalize_device(cfg.train_device)
+    requested_cpu = device == "cpu"
     if requested_cpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    else:
+        # Honor the requested CUDA index. DIMER may send 'cuda:0', a bare '0', or another index;
+        # pinning CUDA_VISIBLE_DEVICES to it makes that GPU the one AutoGluon/torch actually use
+        # instead of silently defaulting to device 0.
+        os.environ["CUDA_VISIBLE_DEVICES"] = device.split(":", 1)[1]
+    if device != cfg.train_device.strip().lower():
+        log(f"DIMER_TRAIN_DEVICE {cfg.train_device!r} normalized to {device!r}.")
     _seed_everything(cfg.seed)
     try:
         import torch
@@ -667,6 +697,8 @@ def _fit_and_evaluate(cfg: Config, train: pd.DataFrame, val: pd.DataFrame,
         "problemType": problem_type,
         "mode": "fine-tune" if fine_tune else "zero-shot",
         "device": "cuda" if use_gpu else "cpu",
+        "requestedDevice": cfg.train_device,
+        "resolvedDevice": device,
         "evalMetric": cfg.eval_metric,
         "mitraMetric": mitra_metric or "<mitra-default>",
         "mitraSeed": cfg.seed,
@@ -732,7 +764,7 @@ def run(cfg: Config) -> int:
             "seed": cfg.seed,
             "timeLimitSeconds": cfg.time_limit,
             "evalMetric": cfg.eval_metric,
-            "trainDevice": cfg.train_device,
+            "trainDevice": metrics["resolvedDevice"],
         },
     }
     write_result(cfg, payload)

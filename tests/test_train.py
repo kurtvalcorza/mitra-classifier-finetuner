@@ -182,3 +182,20 @@ def test_directory_mode_byte_cap(tmp_path, monkeypatch):
             src.read_csv("train.csv")
     finally:
         src.close()
+
+
+def test_normalize_device():
+    # cpu passes through; the DIMER-documented bare-integer form becomes cuda:<n>.
+    assert T._normalize_device("cpu") == "cpu"
+    assert T._normalize_device("CPU") == "cpu"
+    assert T._normalize_device("cuda:0") == "cuda:0"
+    assert T._normalize_device("cuda:1") == "cuda:1"
+    assert T._normalize_device("CUDA:2") == "cuda:2"
+    assert T._normalize_device("0") == "cuda:0"      # bare integer -> cuda:0 (docs call-out)
+    assert T._normalize_device("3") == "cuda:3"      # explicit index honored
+    assert T._normalize_device("gpu") == "cuda:0"
+    assert T._normalize_device("cuda") == "cuda:0"
+    assert T._normalize_device("") == "cuda:0"
+    assert T._normalize_device(None) == "cuda:0"
+    assert T._normalize_device("mps") == "cpu"       # unknown accelerator -> safe CPU fallback
+    assert T._normalize_device("cuda:x") == "cpu"    # malformed index -> CPU fallback
