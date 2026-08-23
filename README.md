@@ -27,8 +27,11 @@ The target's distinct values are the class labels. `train.py` infers `binary` ve
 `multiclass` from the target's cardinality (2–10 classes; Mitra's ceiling is 10) and lets
 AutoGluon load the Mitra classifier checkpoint accordingly.
 
-Two images are provided: `Dockerfile` (GPU, CUDA base, auto-falls back to CPU zero-shot) and
-`Dockerfile.cpu` (a lean CPU-only image). DIMER builds the root `Dockerfile`.
+Two images are provided: `Dockerfile` (the default — a lean CPU image, since the default DIMER
+deployment provisions no GPU node pool and CPU builds stay within CodeBuild's 15-minute limit)
+and `Dockerfile.gpu` (opt-in CUDA image for GPU-enabled environments, auto-falls back to CPU
+zero-shot). DIMER always builds the root `Dockerfile`; for a GPU environment, rename
+`Dockerfile.gpu` to `Dockerfile` before connecting the repo.
 
 The complete pipeline documentation, dataset specification, and the validator are in the
 [mitra-classifier-pipeline](https://github.com/kurtvalcorza/mitra-classifier-pipeline) project.

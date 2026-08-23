@@ -30,7 +30,8 @@ def _cfg(tmp: Path, **over):
         pipeline_metadata={}, target_column="target", drop_columns=[], max_train_rows=10000,
         validation_split=0.2, time_limit=60, seed=0, eval_metric="accuracy", fine_tune=True,
         fine_tune_steps=0, model_dir=None, required_revision=T.PINNED_MITRA_REVISION,
-        max_eval_rows=50000,
+        max_eval_rows=50000, run_id="run-test", session_id="sess-test",
+        expected_accelerator="cpu", model_config={}, selected_model_id=T.BASE_MODEL,
     )
     base.update(over)
     return T.Config(**base)
@@ -241,3 +242,62 @@ def test_write_failure_still_notifies_callback(tmp_path, monkeypatch):
     monkeypatch.setenv("DIMER_DONE_CALLBACK", "http://backend/done")
     assert T.main() == 1
     assert fake.urls == ["http://backend/done"]
+
+
+# --- DIMER artifact contract, model-id lock, GPU burst (engineering docs §5, §3) ---
+
+def test_resolve_selected_model_id_prefers_model_config_then_hp():
+    assert T._resolve_selected_model_id({}, None) == T.BASE_MODEL
+    assert T._resolve_selected_model_id({"id": "mitra-classifier"}, "ignored") == "mitra-classifier"
+    assert T._resolve_selected_model_id({}, "autogluon/mitra-classifier") == "autogluon/mitra-classifier"
+
+
+def test_assert_model_locked_allows_mitra_and_opaque_rejects_other():
+    T._assert_model_locked(T.BASE_MODEL)              # exact
+    T._assert_model_locked("")                        # unset
+    T._assert_model_locked("some-uuid-1234")          # opaque id: allowed
+    T._assert_model_locked("autogluon/mitra-regressor")  # still Mitra family: allowed
+    with pytest.raises(RuntimeError):
+        T._assert_model_locked("ultralytics/yolo26")  # a different base model: rejected
+
+
+def test_data_relative_is_data_rooted(tmp_path: Path):
+    # Production DIMER_OUTPUT_DIR is /data/fine-tuning/<run_id> (two levels below /data).
+    out = tmp_path / "data" / "fine-tuning" / "rid-9"
+    cfg = _cfg(tmp_path, output_dir=out, run_id="rid-9")
+    rel = T._data_relative(cfg, out / "artifacts" / "best.pt")
+    assert rel == "fine-tuning/rid-9/artifacts/best.pt"
+
+
+def test_package_artifacts_writes_best_pt_and_side_files(tmp_path: Path):
+    out = tmp_path / "data" / "fine-tuning" / "rid-9"
+    (out / "mitra_predictor").mkdir(parents=True)
+    (out / "mitra_predictor" / "predictor.pkl").write_bytes(b"weights")
+    (out / "mitra_predictor" / "learner.pkl").write_bytes(b"learner")
+    cfg = _cfg(tmp_path, output_dir=out, run_id="rid-9")
+    metrics = {"mode": "zero-shot", "device": "cpu", "trainRows": 42,
+               "headlineMetric": "accuracy", "headlineScore": 0.9,
+               "artifactPath": str(out / "mitra_predictor")}
+    artifacts = T._package_artifacts(cfg, metrics, {"autogluonVersion": "1.5.0"})
+
+    best = out / "artifacts" / "best.pt"
+    assert best.exists() and zipfile.is_zipfile(best)          # predictor packaged as best.pt
+    assert (out / "evaluation" / "report.json").exists()
+    assert (out / "logs" / "run-summary.json").exists()
+    assert (out / "progress" / "epoch_0001.json").exists()     # progress endpoint non-empty
+
+    assert set(artifacts) == {"modelArtifact", "evaluationReport", "logArtifact"}
+    ma = artifacts["modelArtifact"]
+    assert ma["name"] == "best.pt"
+    assert ma["path"] == "fine-tuning/rid-9/artifacts/best.pt"  # /data-relative
+    assert ma["contentType"] == "application/octet-stream"
+    assert ma["sizeBytes"] == best.stat().st_size and ma["sizeBytes"] > 0
+
+
+def test_burst_disabled_by_default_is_noop(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("GPU_BURST_MODE", raising=False)
+    cfg = _cfg(tmp_path)
+    # Neither should touch S3 or raise when burst is off.
+    T._maybe_burst_download(cfg)
+    T._maybe_burst_upload(tmp_path / "nope.pt", "GPU_BURST_MODEL_KEY")
+    assert not T._burst_enabled()
