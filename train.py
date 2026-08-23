@@ -259,6 +259,11 @@ class Config:
     model_dir: Path | None
     required_revision: str
     max_eval_rows: int
+    run_id: str
+    session_id: str
+    expected_accelerator: str
+    model_config: dict[str, Any]
+    selected_model_id: str
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -275,6 +280,12 @@ def load_config() -> Config:
     hp = json.loads(os.getenv("DIMER_HYPERPARAMETERS_JSON", "{}") or "{}")
     pre = json.loads(os.getenv("DIMER_PREPROCESSING_ARGS_JSON", "{}") or "{}")
     model_dir = os.getenv("DIMER_MODEL_DIR", "").strip()
+    # DIMER_MODEL_CONFIG_JSON carries the selected fine-tunable-model entry (the contract's only
+    # source of the base checkpoint); DIMER_HYPERPARAMETERS_JSON carries model_id (base_model is
+    # normalized into it upstream). This pipeline is locked to BASE_MODEL, so both are read only
+    # as a consistency signal, never to switch models.
+    model_config = json.loads(os.getenv("DIMER_MODEL_CONFIG_JSON", "{}") or "{}")
+    selected_model_id = _resolve_selected_model_id(model_config, hp.get("model_id"))
     return Config(
         dataset_dir=Path(os.getenv("DIMER_DATASET_DIR", "/data/dataset")),
         output_dir=Path(os.getenv("DIMER_OUTPUT_DIR", "/data/output")),
@@ -296,6 +307,11 @@ def load_config() -> Config:
         model_dir=Path(model_dir) if model_dir else None,
         required_revision=os.getenv("DIMER_MITRA_REVISION", "").strip() or PINNED_MITRA_REVISION,
         max_eval_rows=int(os.getenv("DIMER_MAX_EVAL_ROWS", "50000")),
+        run_id=os.getenv("DIMER_RUN_ID", "").strip(),
+        session_id=os.getenv("DIMER_SESSION_ID", "").strip(),
+        expected_accelerator=os.getenv("DIMER_EXPECTED_ACCELERATOR", "").strip(),
+        model_config=model_config,
+        selected_model_id=selected_model_id,
     )
 
 
@@ -650,6 +666,13 @@ def _fit_and_evaluate(cfg: Config, train: pd.DataFrame, val: pd.DataFrame,
     except Exception:  # noqa: BLE001
         gpu_available = False
     use_gpu = gpu_available and not requested_cpu
+    device_fallback_reason = None
+    if not requested_cpu and not gpu_available:
+        device_fallback_reason = (
+            f"DIMER requested device {cfg.train_device!r} but torch reports no CUDA device; "
+            f"running on CPU (the default DIMER deployment provisions no GPU node pool)."
+        )
+        log(device_fallback_reason)
 
     fine_tune = cfg.fine_tune
     if not use_gpu and fine_tune:
@@ -715,6 +738,8 @@ def _fit_and_evaluate(cfg: Config, train: pd.DataFrame, val: pd.DataFrame,
         "device": "cuda" if use_gpu else "cpu",
         "requestedDevice": cfg.train_device,
         "resolvedDevice": device,
+        "cudaAvailable": gpu_available,
+        "deviceFallbackReason": device_fallback_reason,
         "evalMetric": cfg.eval_metric,
         "mitraMetric": mitra_metric or "<mitra-default>",
         "mitraSeed": cfg.seed,
@@ -751,7 +776,203 @@ def _fit_and_evaluate(cfg: Config, train: pd.DataFrame, val: pd.DataFrame,
     return metrics
 
 
+# --- DIMER artifact contract, model-id lock, and GPU burst (engineering docs §5, §3) ---
+
+def _resolve_selected_model_id(model_config: dict[str, Any], hp_model_id: Any) -> str:
+    """Read the wizard's selected model id from DIMER_MODEL_CONFIG_JSON (preferred) or the
+    hyperparameters' model_id. Returns BASE_MODEL when nothing is supplied. Lenient by design:
+    an opaque id/UUID is recorded, not rejected — its mapping is backend-side."""
+    mid = str((model_config or {}).get("id") or (hp_model_id or "")).strip()
+    return mid or BASE_MODEL
+
+
+def _assert_model_locked(selected_model_id: str) -> None:
+    """This pipeline is permanently locked to BASE_MODEL. An explicit, locally-comparable model
+    id MUST equal BASE_MODEL exactly — its full `owner/name` or its bare name. A cross-task Mitra
+    id (the sibling classifier/regressor) is therefore rejected, not just a non-Mitra one. Only an
+    opaque backend id — one that cannot be resolved to a checkpoint locally, e.g. a UUID — is
+    allowed through, since it may be the platform's own alias for this same base. An unset id
+    passes (nothing was overridden)."""
+    mid = (selected_model_id or "").strip()
+    if not mid:
+        return
+    allowed = {BASE_MODEL.lower(), BASE_MODEL.rsplit("/", 1)[-1].lower()}
+    if mid.lower() in allowed:
+        return
+    # Treat an id as explicit/known when it looks like a model reference we can compare locally:
+    # a repo path (owner/name) or one that names Mitra. Those must match BASE_MODEL exactly.
+    is_explicit = ("/" in mid) or ("mitra" in mid.lower())
+    if is_explicit:
+        raise RuntimeError(
+            f"This pipeline is locked to {BASE_MODEL}; the wizard selected {mid!r}. "
+            f"Use the correct Mitra pipeline, or clear the Base Model override."
+        )
+
+
+def _data_relative(cfg: Config, path: Path) -> str:
+    """Path relative to the /data mount root, as the DIMER exporter expects
+    (`fine-tuning/<run_id>/...`). In production DIMER_OUTPUT_DIR is `/data/fine-tuning/<run_id>`
+    (two levels below /data), so parents[1] is /data. Falls back to a run-id-built path when the
+    output dir is shallower (e.g. a local `/data/output` default)."""
+    p = Path(path).resolve()
+    try:
+        return str(p.relative_to(cfg.output_dir.resolve().parents[1])).replace("\\", "/")
+    except (ValueError, IndexError):
+        try:
+            tail = p.relative_to(cfg.output_dir.resolve())
+        except ValueError:
+            tail = Path(p.name)
+        rid = cfg.run_id or cfg.output_dir.name
+        return str(Path("fine-tuning") / rid / tail).replace("\\", "/")
+
+
+def _artifact_entry(cfg: Config, path: Path, content_type: str) -> dict[str, Any]:
+    p = Path(path)
+    return {
+        "path": _data_relative(cfg, p),
+        "name": p.name,
+        "contentType": content_type,
+        "sizeBytes": p.stat().st_size if p.exists() else 0,
+    }
+
+
+def _package_artifacts(cfg: Config, metrics: dict[str, Any],
+                       provenance: dict[str, Any]) -> dict[str, Any]:
+    """Materialize the DIMER finetuner artifact layout under DIMER_OUTPUT_DIR and return the
+    `artifacts` object (engineering docs §5):
+
+        artifacts/best.pt         REQUIRED name — the exporter greps exactly this
+        evaluation/report.json
+        logs/run-summary.json
+        progress/epoch_0001.json
+
+    NOTE (unconfirmed against the on-prem exporter): Mitra has no single weight file, so best.pt
+    is a ZIP of the AutoGluon predictor directory. The exporter matches the *name*; unpacking a
+    predictor archive is a backend-side concern that still needs confirmation. The raw predictor
+    directory is left in place and its location recorded in metadata for compatibility."""
+    out = cfg.output_dir
+    predictor_dir = Path(metrics.get("artifactPath") or (out / "mitra_predictor"))
+
+    art_dir = out / "artifacts"
+    art_dir.mkdir(parents=True, exist_ok=True)
+    best = art_dir / "best.pt"
+    # Whole-file write (no rename/copy2) — /data is a Mountpoint-S3 CSI volume (§7).
+    with zipfile.ZipFile(best, "w", zipfile.ZIP_DEFLATED) as zf:
+        if predictor_dir.exists():
+            for f in sorted(predictor_dir.rglob("*")):
+                if f.is_file():
+                    zf.write(f, str(Path("mitra_predictor") / f.relative_to(predictor_dir)))
+
+    eval_dir = out / "evaluation"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    report = eval_dir / "report.json"
+    report.write_text(
+        json.dumps({"metrics": metrics, "provenance": provenance}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    logs_dir = out / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    summary = logs_dir / "run-summary.json"
+    summary.write_text(
+        json.dumps({
+            "template": TEMPLATE_NAME,
+            "sessionId": cfg.session_id,
+            "runId": cfg.run_id,
+            "mode": metrics.get("mode"),
+            "device": metrics.get("device"),
+            "trainRows": metrics.get("trainRows"),
+            "headlineMetric": metrics.get("headlineMetric"),
+            "headlineScore": metrics.get("headlineScore"),
+            "autogluonVersion": provenance.get("autogluonVersion"),
+        }, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    # Mitra exposes no per-epoch loop; write one terminal progress record so the progress
+    # endpoint returns something rather than []. Telemetry must never fail a run.
+    try:
+        prog_dir = out / "progress"
+        prog_dir.mkdir(parents=True, exist_ok=True)
+        (prog_dir / "epoch_0001.json").write_text(
+            json.dumps({
+                "epoch": 1, "totalEpochs": 1,
+                "metrics": {k: metrics[k] for k in
+                            ("headlineScore", "mae", "rmse", "trainRows") if k in metrics},
+            }, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:  # noqa: BLE001 - progress telemetry is never allowed to fail the run
+        log(f"Progress telemetry write failed (non-fatal): {exc}")
+
+    return {
+        "modelArtifact": _artifact_entry(cfg, best, "application/octet-stream"),
+        "evaluationReport": _artifact_entry(cfg, report, "application/json"),
+        "logArtifact": _artifact_entry(cfg, summary, "application/json"),
+    }
+
+
+def _burst_enabled() -> bool:
+    return str(os.getenv("GPU_BURST_MODE", "")).strip().lower() in ("1", "true", "yes")
+
+
+def _s3_client():
+    import boto3  # imported lazily: only burst mode needs it
+
+    return boto3.client("s3", endpoint_url=(os.getenv("S3_ENDPOINT_URL") or None))
+
+
+def _maybe_burst_download(cfg: Config) -> None:
+    """In GPU burst mode /data is NOT mounted (§3); pull the dataset from S3 into
+    DIMER_DATASET_DIR before anything reads it. A download failure is fatal — there is no
+    dataset otherwise."""
+    if not _burst_enabled():
+        return
+    bucket = os.getenv("GPU_BURST_S3_BUCKET")
+    prefix = os.getenv("GPU_BURST_DATASET_PREFIX", "") or ""
+    if not bucket:
+        log("GPU_BURST_MODE set but GPU_BURST_S3_BUCKET is unset; cannot fetch dataset.")
+        return
+    s3 = _s3_client()
+    cfg.dataset_dir.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith("/"):
+                continue
+            rel = key[len(prefix):].lstrip("/") if prefix else key
+            dst = cfg.dataset_dir / (rel or Path(key).name)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            s3.download_file(bucket, key, str(dst))
+            n += 1
+    log(f"GPU burst: downloaded {n} object(s) from s3://{bucket}/{prefix} into {cfg.dataset_dir}.")
+
+
+def _maybe_burst_upload(local_path: Path, key_env: str) -> None:
+    """Best-effort upload of a produced file to its GPU-burst S3 key. Never raises: a failed
+    upload after a long train is logged, not crashed (crashing cannot recover the bytes)."""
+    if not _burst_enabled():
+        return
+    bucket = os.getenv("GPU_BURST_S3_BUCKET")
+    key = os.getenv(key_env)
+    if not (bucket and key):
+        log(f"GPU burst upload skipped: bucket or {key_env} unset.")
+        return
+    try:
+        p = Path(local_path)
+        if not p.exists():
+            log(f"GPU burst upload skipped: {p} does not exist.")
+            return
+        _s3_client().upload_file(str(p), bucket, key)
+        log(f"GPU burst: uploaded {p.name} -> s3://{bucket}/{key}.")
+    except Exception as exc:  # noqa: BLE001 - upload failure must not mask the run's real result
+        log(f"GPU burst upload failed for {key_env}: {exc}")
+
+
 def run(cfg: Config) -> int:
+    _assert_model_locked(cfg.selected_model_id)
+    _maybe_burst_download(cfg)
     provenance = resolve_and_verify_weights(cfg)
     source = DatasetSource(cfg.dataset_dir)
     try:
@@ -761,6 +982,8 @@ def run(cfg: Config) -> int:
     metrics = _fit_and_evaluate(cfg, train, val, test, num_classes)
     provenance["dataset"] = _dataset_sha256(cfg)
     provenance["autogluonVersion"] = getattr(sys.modules.get("autogluon.tabular"), "__version__", None)
+    artifacts = _package_artifacts(cfg, metrics, provenance)
+    _maybe_burst_upload(cfg.output_dir / "artifacts" / "best.pt", "GPU_BURST_MODEL_KEY")
     headline = metrics.get("headlineScore")
     payload = {
         "successful": True,
@@ -769,18 +992,32 @@ def run(cfg: Config) -> int:
             + (f"; holdout {cfg.eval_metric} {headline:.4f}." if headline is not None else ".")
         ),
         "metrics": metrics,
-        "artifacts": {"modelDir": str(cfg.output_dir / "mitra_predictor")},
+        "artifacts": artifacts,
         "provenance": provenance,
         "metadata": {
             "template": TEMPLATE_NAME,
             "taskType": cfg.default_task_type,
+            "sessionId": cfg.session_id,
+            "runId": cfg.run_id,
+            "datasetDir": str(cfg.dataset_dir),
+            "outputDir": str(cfg.output_dir),
             "baseModel": BASE_MODEL,
+            "selectedModelId": cfg.selected_model_id,
+            "selectedModel": cfg.model_config or None,
+            "modelDir": str(cfg.output_dir / "mitra_predictor"),
             "targetColumn": cfg.target_column,
             "dropColumns": cfg.drop_columns,
             "seed": cfg.seed,
             "timeLimitSeconds": cfg.time_limit,
             "evalMetric": cfg.eval_metric,
             "trainDevice": metrics["resolvedDevice"],
+            "device": {
+                "expectedAccelerator": cfg.expected_accelerator or None,
+                "requestedDevice": cfg.train_device,
+                "selectedDevice": metrics["resolvedDevice"],
+                "cudaAvailable": metrics.get("cudaAvailable", False),
+                "fallbackReason": metrics.get("deviceFallbackReason"),
+            },
         },
     }
     write_result(cfg, payload)
@@ -836,6 +1073,12 @@ def _persist_failure(cfg: Config | None, exc: Exception) -> None:
         "metadata": {
             "template": TEMPLATE_NAME,
             "taskType": (cfg.default_task_type if cfg else "tabular_classification"),
+            # The diagnostics page reads these; a failed run with baseModel:null reads as if
+            # model resolution broke, so populate them on the crash path too.
+            "baseModel": BASE_MODEL,
+            "selectedModelId": (cfg.selected_model_id if cfg else BASE_MODEL),
+            "sessionId": (cfg.session_id if cfg else os.getenv("DIMER_SESSION_ID", "").strip()),
+            "runId": (cfg.run_id if cfg else os.getenv("DIMER_RUN_ID", "").strip()),
         },
     }
     try:
@@ -862,6 +1105,10 @@ def main() -> int:
         _persist_failure(cfg, exc)
         return 1
     finally:
+        # In GPU burst mode result.json lands only on the container filesystem; push it to S3 so
+        # the backend can read it. Best-effort, before the callback, and never masks it.
+        if cfg is not None:
+            _maybe_burst_upload(cfg.result_path, "GPU_BURST_RESULT_KEY")
         try:
             result = notify_done_callback(cfg) if cfg is not None else _notify_from_env()
             log(f"Callback: {json.dumps(result, sort_keys=True)}")

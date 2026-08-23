@@ -11,3 +11,6 @@ autogluon.tabular[mitra]==1.5.0
 pandas==2.2.3
 numpy==1.26.4
 requests==2.32.3
+# boto3 is used only in GPU burst mode (S3 dataset-in / result+model-out); imported lazily so a
+# normal /data-mounted run never touches it. Pinned to match the validator containers.
+boto3==1.35.76
