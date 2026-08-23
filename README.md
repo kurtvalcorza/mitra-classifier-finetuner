@@ -41,7 +41,8 @@ zero-shot). DIMER always builds the root `Dockerfile`; for a GPU environment, re
   no single weight file, so this is a zip of the AutoGluon predictor directory.
 - `evaluation/report.json` — the evaluation metrics report.
 - `logs/run-summary.json` — the run summary log.
-- `progress/epoch_*.json` — per-epoch progress.
+- `progress/epoch_0001.json` — a single terminal progress record (Mitra exposes no per-epoch
+  loop, so there is exactly one).
 
 `result.json` carries the metrics and `provenance`, plus an `artifacts` object with
 `modelArtifact`, `evaluationReport`, and `logArtifact` entries — each `{path, name, contentType,
