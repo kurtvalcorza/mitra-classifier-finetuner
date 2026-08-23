@@ -3,7 +3,6 @@ on:
   push:
     branches: [main]
   pull_request:
-
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -12,11 +11,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # train.py lazy-imports autogluon inside fit, so unit tests need only these light deps.
       - run: pip install pandas numpy scikit-learn huggingface_hub requests pytest
       - name: Compile
-        run: python -m py_compile train.py
+        run: python -m py_compile train.py contract_hardening.py contract_entrypoint.py scripts/integration_smoke.py
       - name: Shared block (cross-repo parity)
         run: python scripts/check_shared.py
+      - name: DIMER contract
+        run: python scripts/check_contract.py
       - name: Unit tests
         run: python -m pytest tests/ -q
