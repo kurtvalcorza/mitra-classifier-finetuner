@@ -2,8 +2,8 @@
 
 DIMER fine-tuner for the Mitra classifier pipeline. It fine-tunes AutoGluon's Mitra
 ([`autogluon/mitra-classifier`](https://huggingface.co/autogluon/mitra-classifier)) on a
-validated tabular-classification dataset, then writes the model artifact and a `result.json` with
-metrics and provenance. See the [model card](https://github.com/kurtvalcorza/mitra-classifier-pipeline/blob/main/MODEL_CARD.md)
+validated tabular-classification dataset, then writes the fine-tuner artifacts and a `result.json`
+with metrics and provenance (see [Outputs](#outputs)). See the [model card](https://github.com/kurtvalcorza/mitra-classifier-pipeline/blob/main/MODEL_CARD.md)
 for the model's provenance, checksums, and licence.
 
 - Runs as a GPU Kubernetes Job, and also on a CPU-only node (see below).
@@ -32,6 +32,21 @@ deployment provisions no GPU node pool and CPU builds stay within CodeBuild's 15
 and `Dockerfile.gpu` (opt-in CUDA image for GPU-enabled environments, auto-falls back to CPU
 zero-shot). DIMER always builds the root `Dockerfile`; for a GPU environment, rename
 `Dockerfile.gpu` to `Dockerfile` before connecting the repo.
+
+## Outputs
+
+`train.py` materializes the DIMER fine-tuner artifact layout under `DIMER_OUTPUT_DIR`:
+
+- `artifacts/best.pt` — the exported model artifact (the name DIMER's exporter greps). Mitra has
+  no single weight file, so this is a zip of the AutoGluon predictor directory.
+- `evaluation/report.json` — the evaluation metrics report.
+- `logs/run-summary.json` — the run summary log.
+- `progress/epoch_*.json` — per-epoch progress.
+
+`result.json` carries the metrics and `provenance`, plus an `artifacts` object with
+`modelArtifact`, `evaluationReport`, and `logArtifact` entries — each `{path, name, contentType,
+sizeBytes}`, `path` relative to the `/data` mount (`fine-tuning/<run_id>/...`). The raw AutoGluon
+predictor directory is also left in place under `mitra_predictor/`.
 
 The complete pipeline documentation, dataset specification, and the validator are in the
 [mitra-classifier-pipeline](https://github.com/kurtvalcorza/mitra-classifier-pipeline) project.
