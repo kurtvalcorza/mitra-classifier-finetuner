@@ -787,11 +787,22 @@ def _resolve_selected_model_id(model_config: dict[str, Any], hp_model_id: Any) -
 
 
 def _assert_model_locked(selected_model_id: str) -> None:
-    """This pipeline is permanently locked to BASE_MODEL. Fail loudly only when the wizard
-    clearly names a DIFFERENT base model — a repo path (owner/name) whose name is not Mitra —
-    so a mis-selected pipeline does not silently train the wrong model. Opaque ids pass."""
+    """This pipeline is permanently locked to BASE_MODEL. An explicit, locally-comparable model
+    id MUST equal BASE_MODEL exactly — its full `owner/name` or its bare name. A cross-task Mitra
+    id (the sibling classifier/regressor) is therefore rejected, not just a non-Mitra one. Only an
+    opaque backend id — one that cannot be resolved to a checkpoint locally, e.g. a UUID — is
+    allowed through, since it may be the platform's own alias for this same base. An unset id
+    passes (nothing was overridden)."""
     mid = (selected_model_id or "").strip()
-    if mid and "/" in mid and "mitra" not in mid.lower():
+    if not mid:
+        return
+    allowed = {BASE_MODEL.lower(), BASE_MODEL.rsplit("/", 1)[-1].lower()}
+    if mid.lower() in allowed:
+        return
+    # Treat an id as explicit/known when it looks like a model reference we can compare locally:
+    # a repo path (owner/name) or one that names Mitra. Those must match BASE_MODEL exactly.
+    is_explicit = ("/" in mid) or ("mitra" in mid.lower())
+    if is_explicit:
         raise RuntimeError(
             f"This pipeline is locked to {BASE_MODEL}; the wizard selected {mid!r}. "
             f"Use the correct Mitra pipeline, or clear the Base Model override."

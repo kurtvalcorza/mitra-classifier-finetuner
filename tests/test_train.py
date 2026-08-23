@@ -252,13 +252,16 @@ def test_resolve_selected_model_id_prefers_model_config_then_hp():
     assert T._resolve_selected_model_id({}, "autogluon/mitra-classifier") == "autogluon/mitra-classifier"
 
 
-def test_assert_model_locked_allows_mitra_and_opaque_rejects_other():
-    T._assert_model_locked(T.BASE_MODEL)              # exact
-    T._assert_model_locked("")                        # unset
-    T._assert_model_locked("some-uuid-1234")          # opaque id: allowed
-    T._assert_model_locked("autogluon/mitra-regressor")  # still Mitra family: allowed
-    with pytest.raises(RuntimeError):
-        T._assert_model_locked("ultralytics/yolo26")  # a different base model: rejected
+def test_assert_model_locked_requires_exact_base_or_opaque():
+    T._assert_model_locked(T.BASE_MODEL)                     # exact owner/name
+    T._assert_model_locked(T.BASE_MODEL.rsplit("/", 1)[-1])  # bare name of the base
+    T._assert_model_locked("")                              # unset -> no override
+    T._assert_model_locked("some-uuid-1234")               # opaque backend id: allowed
+    # A cross-task Mitra id (the sibling regressor) and any other explicit id are rejected —
+    # "contains mitra" is NOT sufficient; the locked base must match exactly.
+    for other in ("autogluon/mitra-regressor", "mitra-regressor", "ultralytics/yolo26"):
+        with pytest.raises(RuntimeError):
+            T._assert_model_locked(other)
 
 
 def test_data_relative_is_data_rooted(tmp_path: Path):
