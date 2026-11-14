@@ -304,3 +304,23 @@ def test_burst_disabled_by_default_is_noop(tmp_path: Path, monkeypatch):
     T._maybe_burst_download(cfg)
     T._maybe_burst_upload(tmp_path / "nope.pt", "GPU_BURST_MODEL_KEY")
     assert not T._burst_enabled()
+
+
+def test_nested_zip_upload_resolves_train(tmp_path):
+    """Refs kurtvalcorza/mitra-*-dataset-validator#8: the validator unwraps a lone inner .zip,
+    so the finetuner (same shared block) must read the same upload the same way."""
+    csv = pd.DataFrame({"f1": [1, 2, 3], "target": [0, 1, 0]}).to_csv(index=False)
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("train.csv", csv)
+    with zipfile.ZipFile(tmp_path / "upload.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("dataset.zip", inner.getvalue())
+    src = T.DatasetSource(tmp_path)
+    try:
+        assert src.unwrapped_from == "dataset.zip"
+        assert not src.has_nested_zip()
+        train = src.resolve_single("train")
+        assert train == "train.csv"
+        assert list(src.read_csv(train).columns) == ["f1", "target"]
+    finally:
+        src.close()
